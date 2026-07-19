@@ -2,6 +2,9 @@ cmake_minimum_required( VERSION 3.13 )
 
 project( uxplay )
 
+set(BBT_AIRPLAY_VERSION "0.1.0" CACHE STRING "BigBirdTouch AirPlay receiver version")
+set(BBT_UPSTREAM_REVISION "3ca7526387e894d6848b84c209de361c3bedd1ec" CACHE STRING "Pinned UxPlay revision")
+
 message( STATUS "Project name: " ${PROJECT_NAME} )
 
 include(GNUInstallDirs)
@@ -68,15 +71,19 @@ endif()
 add_subdirectory( lib/llhttp )
 add_subdirectory( lib/playfair )
 add_subdirectory( lib )
-add_subdirectory( renderers )
 
-if  ( GST_MACOS )
-     add_definitions( -DGST_MACOS )
-     message ( STATUS "define GST_MACOS" )
-endif()
+find_package( PkgConfig REQUIRED )
+pkg_check_modules( GLIB2 REQUIRED glib-2.0 )
 
-add_executable( uxplay uxplay.cpp )
-target_link_libraries( uxplay renderers airplay )
+add_executable( uxplay uxplay.cpp bbap_writer.cpp bbap_renderer_stubs.cpp )
+target_compile_definitions(uxplay PRIVATE
+  BBT_AIRPLAY_VERSION="${BBT_AIRPLAY_VERSION}"
+  BBT_UPSTREAM_REVISION="${BBT_UPSTREAM_REVISION}"
+)
+target_include_directories( uxplay PRIVATE ${GLIB2_INCLUDE_DIRS} )
+target_link_directories( uxplay PRIVATE ${GLIB2_LIBRARY_DIRS} )
+target_link_libraries( uxplay airplay ${GLIB2_LINK_LIBRARIES} )
+set_target_properties( uxplay PROPERTIES OUTPUT_NAME "bbt_airplay_receiver" )
 if (DBUS_FOUND)
       target_link_libraries( uxplay ${DBUS_LIBRARY})
 endif()

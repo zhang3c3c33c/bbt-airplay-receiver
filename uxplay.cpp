@@ -26,6 +26,7 @@
 #include <ctype.h>
 #include <string>
 #include <algorithm>
+#include <atomic>
 #include <vector>
 #include <fstream>
 #include <sstream>
@@ -67,12 +68,21 @@
 #include "renderers/video_renderer.h"
 #include "renderers/audio_renderer.h"
 #include "renderers/mux_renderer.h"
+#include "bbap_writer.h"
 #ifdef DBUS
 #include <dbus/dbus.h>
 #endif
 
 
 #define VERSION "1.74"
+
+#ifndef BBT_AIRPLAY_VERSION
+#define BBT_AIRPLAY_VERSION "0.1.0"
+#endif
+
+#ifndef BBT_UPSTREAM_REVISION
+#define BBT_UPSTREAM_REVISION "unknown"
+#endif
 
 #define SECOND_IN_USECS 1000000
 #define SECOND_IN_NSECS 1000000000UL
@@ -204,6 +214,42 @@ static std::string audio_rtp_pipeline = "";
 static GMainLoop *gmainloop = NULL;
 static bool mux_to_file = false;
 static std::string mux_filename = "recording";
+static bool bbap_stdio = false;
+static bbap::Configure bbap_config;
+static std::atomic<bool> bbap_shutdown_requested(false);
+static std::atomic<bool> bbap_disconnect_requested(false);
+
+static void bbap_control_request(const char *type) {
+    if (!type) return;
+    if (!strcmp(type, "shutdown")) {
+        bbap_shutdown_requested.store(true);
+    } else if (!strcmp(type, "disconnect_client")) {
+        bbap_disconnect_requested.store(true);
+    }
+    /* request_keyframe is best-effort in this first video-only POC.  UxPlay's
+     * pinned upstream has no stable callback for requesting an encoder IDR. */
+}
+
+static gboolean bbap_control_callback(gpointer loop) {
+    if (bbap_disconnect_requested.exchange(false)) {
+        if (raop) raop_remove_known_connections(raop);
+        bbap::reset_media();
+        bbap::send_state("disconnected", "", "sender_request");
+        bbap::send_state("advertising");
+    }
+    if (bbap_shutdown_requested.exchange(false)) {
+        bbap::send_stopped();
+        relaunch_video = false;
+        g_main_loop_quit((GMainLoop *) loop);
+        return TRUE;
+    }
+    return TRUE;
+}
+
+static gboolean bbap_heartbeat_callback(gpointer) {
+    bbap::send_heartbeat();
+    return TRUE;
+}
 
 //Support for D-Bus-based screensaver inhibition (org.freedesktop.ScreenSaver) 
 static unsigned int scrsv = 0;
@@ -676,7 +722,7 @@ static void main_loop()  {
     preserve_connections = false;
     n_video_renderers = 0;
     n_audio_renderers = 0;
-    if (use_video) {
+    if (use_video && !bbap_stdio) {
         n_video_renderers = 1;
         relaunch_video = true;
         if (url.empty()) {
@@ -700,7 +746,7 @@ static void main_loop()  {
             gst_video_bus_watch_id[i] = (guint) video_renderer_listen((void *)loop, i);
         }
     }
-    if (use_audio) {
+    if (use_audio && !bbap_stdio) {
         rtptime_start = 0;
         rtptime_end = 0;
         monitor_progress = true;
@@ -717,6 +763,12 @@ static void main_loop()  {
     missed_feedback = 0;
     guint feedback_watch_id = g_timeout_add_seconds(1, (GSourceFunc) feedback_callback, (gpointer) loop);
     guint reset_watch_id = g_timeout_add(100, (GSourceFunc) reset_callback, (gpointer) loop);
+    guint bbap_control_watch_id = 0;
+    guint bbap_heartbeat_watch_id = 0;
+    if (bbap_stdio) {
+        bbap_control_watch_id = g_timeout_add(25, (GSourceFunc) bbap_control_callback, (gpointer) loop);
+        bbap_heartbeat_watch_id = g_timeout_add_seconds(5, (GSourceFunc) bbap_heartbeat_callback, NULL);
+    }
 
 #ifdef _WIN32
     gmainloop = loop;
@@ -752,8 +804,10 @@ static void main_loop()  {
     if (progress_id > 0) g_source_remove(progress_id);
     if (video_eos_watch_id > 0) g_source_remove(video_eos_watch_id);
     if (feedback_watch_id > 0) g_source_remove(feedback_watch_id);
+    if (bbap_control_watch_id > 0) g_source_remove(bbap_control_watch_id);
+    if (bbap_heartbeat_watch_id > 0) g_source_remove(bbap_heartbeat_watch_id);
     g_main_loop_unref(loop);
-}    
+}
 
 static int parse_hw_addr (std::string str, std::vector<char> &hw_addr) {
     for (int i = 0; i < (int) str.length(); i += 3) {
@@ -1206,7 +1260,15 @@ static void parse_arguments (int argc, char *argv[]) {
     }
     for (int i = 1; i < argc; i++) {
         std::string arg(argv[i]);
-        if (arg == "-rc") {
+        if (arg == "--bbap-stdio") {
+            bbap_stdio = true;
+        } else if (arg == "--protocol-major") {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "--protocol-major requires a value\n");
+                exit(1);
+            }
+            i++;
+        } else if (arg == "-rc") {
             i++;  //specifies startup file: has already been processed
         } else if (arg == "-allow") {
             if (!option_has_value(i, argc, arg, argv[i+1])) exit(1);
@@ -2169,6 +2231,10 @@ extern "C" void video_reset(void *cls, reset_type_t type) {
 
 extern "C" int video_set_codec(void *cls, video_codec_t codec) {
     bool video_is_h265 = (codec == VIDEO_CODEC_H265);
+    if (bbap_stdio) {
+        bbap::set_video_codec(video_is_h265);
+        return 0;
+    }
     if (mux_to_file) {
         mux_renderer_choose_video_codec(video_is_h265);
     }
@@ -2179,6 +2245,10 @@ extern "C" int video_set_codec(void *cls, video_codec_t codec) {
 }
 
 extern "C" void display_pin(void *cls, char *pin) {
+    if (bbap_stdio) {
+        bbap::send_state("pairing", pin ? pin : "");
+        return;
+    }
     int margin = 10;
     int spacing = 3;
     char *image = create_pin_display(pin, margin, spacing);
@@ -2217,6 +2287,7 @@ extern "C" void export_dacp(void *cls, const char *active_remote, const char *da
 extern "C" void conn_init (void *cls) {
     open_connections++;
     LOGD("Open connections: %i", open_connections);
+    if (bbap_stdio) bbap::send_state("connected");
     //video_renderer_update_background(1);
 }
 
@@ -2225,6 +2296,11 @@ extern "C" void conn_destroy (void *cls) {
     open_connections--;
     LOGD("Open connections: %i", open_connections);
     if (open_connections == 0) {
+        if (bbap_stdio) {
+            bbap::reset_media();
+            bbap::send_state("disconnected");
+            bbap::send_state("advertising");
+        }
         remote_clock_offset = 0;
         if (use_audio) {
             audio_renderer_stop();
@@ -2278,6 +2354,7 @@ extern "C" void report_client_request(void *cls, char *deviceid, char * model, c
         *admit = false;
         LOGI("*** attempt to connect by blocked client (clientID %s): DENIED\n", deviceid);
     }
+    if (bbap_stdio && *admit) bbap::send_state("connected");
     // Pass device model to renderer for device frame display
     if (*admit && use_video) {
         video_renderer_set_device_model(model, name);
@@ -2285,6 +2362,13 @@ extern "C" void report_client_request(void *cls, char *deviceid, char * model, c
 }
 
 extern "C" void audio_process (void *cls, raop_ntp_t *ntp, audio_decode_struct *data) {
+    if (bbap_stdio) {
+        if (data) {
+            bbap::push_audio(data->data, (size_t)data->data_len, data->ct,
+                             data->seqnum, data->ntp_time_remote);
+        }
+        return;
+    }
     if (dump_audio) {
         dump_audio_to_file(data->data, data->data_len, (data->data)[0] & 0xf0);
     }
@@ -2320,6 +2404,19 @@ extern "C" void audio_process (void *cls, raop_ntp_t *ntp, audio_decode_struct *
 }
 
 extern "C" void video_process (void *cls, raop_ntp_t *ntp, video_decode_struct *data) {
+    if (bbap_stdio) {
+        /* Pinned UxPlay marks an AU that failed decrypt/NAL validation by
+         * changing payload_out[0] from the Annex-B zero byte to 1.  Its
+         * GStreamer renderer discards that AU.  Never forward it into the
+         * Sender decoder: doing so poisons the H.264 reference chain and
+         * produces persistent block corruption until a later IDR. */
+        if (!data || data->data_len < 4 || data->data[0] == 1) {
+            bbap::mark_video_discontinuity();
+            return;
+        }
+        bbap::push_video(data->data, (size_t) data->data_len, data->ntp_time_remote);
+        return;
+    }
     if (dump_video) {
         dump_video_to_file(data->data, data->data_len);
     }
@@ -2368,12 +2465,20 @@ extern "C" void video_resume (void *cls) {
 
 
 extern "C" void audio_flush (void *cls) {
+    if (bbap_stdio) {
+        bbap::reset_audio();
+        return;
+    }
     if (use_audio) {
         audio_renderer_flush();
     }
 }
 
 extern "C" void video_flush (void *cls) {
+    if (bbap_stdio) {
+        bbap::reset_video();
+        return;
+    }
     if (use_video) {
         video_renderer_flush();
     }
@@ -2429,6 +2534,10 @@ extern "C" void audio_set_volume (void *cls, float volume) {
 }
 
 extern "C" void audio_get_format (void *cls, unsigned char *ct, unsigned short *spf, bool *usingScreen, bool *isMedia, uint64_t *audioFormat) {
+    if (bbap_stdio) {
+        bbap::set_audio_format(*ct, *spf);
+        return;
+    }
     unsigned char type;
     LOGI("ct=%d spf=%d usingScreen=%d isMedia=%d  audioFormat=0x%lx",*ct, *spf, *usingScreen, *isMedia, (unsigned long) *audioFormat);
     switch (*ct) {
@@ -2465,6 +2574,12 @@ extern "C" void audio_get_format (void *cls, unsigned char *ct, unsigned short *
 }
 
 extern "C" void video_report_size(void *cls, float *width_source, float *height_source, float *width, float *height) {
+    if (bbap_stdio) {
+        unsigned int w = (unsigned int) (*width_source > 0 ? *width_source : *width);
+        unsigned int h = (unsigned int) (*height_source > 0 ? *height_source : *height);
+        bbap::set_video_size(w, h);
+        return;
+    }
     if (use_video) {
         video_renderer_size(width_source, height_source, width, height);
     }
@@ -2870,6 +2985,43 @@ int main (int argc, char *argv[]) {
     std::vector<char> server_hw_addr;
     std::string config_file = "";
 
+    for (int i = 1; i < argc; i++) {
+        if (!strcmp(argv[i], "--version-json")) {
+            printf("{\"name\":\"bbt_airplay_receiver\",\"version\":\"%s\","
+                   "\"upstream\":\"UxPlay/%s\",\"license\":\"GPL-3.0-or-later\","
+                   "\"protocolMajor\":1,\"videoCodecs\":[\"h264\",\"hevc\"],"
+                   "\"audioCodecs\":[\"aac-eld\",\"alac\"],\"gstreamer\":false}\n",
+                   BBT_AIRPLAY_VERSION, BBT_UPSTREAM_REVISION);
+            return 0;
+        }
+        if (!strcmp(argv[i], "--self-test-json")) {
+            printf("{\"ok\":true,\"bbap\":1,\"aac-eld\":true,\"alac\":true,"
+                   "\"gstreamer\":false}\n");
+            return 0;
+        }
+    }
+
+    unsigned int requested_protocol_major = 1;
+    for (int i = 1; i < argc; i++) {
+        if (!strcmp(argv[i], "--bbap-stdio")) {
+            bbap_stdio = true;
+        } else if (!strcmp(argv[i], "--protocol-major") && i + 1 < argc) {
+            requested_protocol_major = (unsigned int) strtoul(argv[++i], NULL, 10);
+        }
+    }
+    if (bbap_stdio) {
+        std::string error;
+        if (!bbap::stdio_initialize(requested_protocol_major, &error)) {
+            fprintf(stderr, "BBAP initialization failed: %s\n", error.c_str());
+            exit(1);
+        }
+        if (!bbap::send_hello() || !bbap::read_configure(&bbap_config, &error)) {
+            fprintf(stderr, "BBAP handshake failed: %s\n", error.c_str());
+            exit(1);
+        }
+        bbap::start_control_reader(bbap_control_request);
+    }
+
 #ifdef _WIN32
     if (!SetConsoleCtrlHandler(CtrlHandler, TRUE)) {
         LOGE("Could not set control handler");
@@ -2928,6 +3080,22 @@ int main (int argc, char *argv[]) {
         read_config_file(config_file.c_str(), argv[0]);
     }
     parse_arguments (argc, argv);
+
+    if (bbap_stdio) {
+        server_name = bbap_config.receiver_name;
+        do_append_hostname = false;
+        pin_pw = (bbap_config.pin_mode == "random") ? 3 : 0;
+        h265_support = bbap_config.allow_hevc;
+        display[0] = (unsigned short) bbap_config.width;
+        display[1] = (unsigned short) bbap_config.height;
+        display[2] = (unsigned short) bbap_config.refresh_rate;
+        display[3] = (unsigned short) bbap_config.max_fps;
+        use_video = false;  /* protocol stays active; only the GStreamer renderer is disabled */
+        use_audio = false;  /* mirror audio is emitted as compressed BBAP; GStreamer stays disabled */
+        bbap::configure_video(bbap_config.max_fps);
+        bbap::configure_audio(bbap_config.audio_enabled);
+        bbap::send_state("starting");
+    }
 
     log_level = (debug_log ? LOGGER_DEBUG_DATA : LOGGER_INFO);
     if (debug_log && suppress_packet_debug_data) {
@@ -3117,7 +3285,7 @@ int main (int argc, char *argv[]) {
         append_hostname(server_name);
     }
 
-    if (!gstreamer_init()) {
+    if (!bbap_stdio && !gstreamer_init()) {
         LOGE ("stopping");
         exit (1);
     }
@@ -3219,6 +3387,7 @@ int main (int argc, char *argv[]) {
         stop_dnssd();
         cleanup();
     }
+    if (bbap_stdio) bbap::send_state("advertising");
     reconnect:
     compression_type = 0;
     close_window = new_window_closing_behavior;

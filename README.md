@@ -1,3 +1,21 @@
+# BigBirdTouch AirPlay Receiver
+
+This repository contains the GPL-3.0-or-later AirPlay receiver sidecar used by
+BigBirdTouch Sender. It is a modified fork of
+[UxPlay](https://github.com/FDH2/UxPlay), based on upstream revision
+`3ca7526387e894d6848b84c209de361c3bedd1ec`.
+
+The BigBirdTouch changes add a versioned BBAP stdio protocol, compressed
+AAC-ELD/ALAC audio forwarding, a renderer-free Windows build, deterministic
+runtime/source packaging, and self-test/version metadata. The sidecar remains
+an independently replaceable process and is not linked into `sender.exe`.
+
+Windows build and packaging instructions are in
+[`packaging/BUILD.md`](packaging/BUILD.md). The original UxPlay documentation
+continues below.
+
+---
+
 # UxPlay 1.74 (Experimental): AirPlay-Mirror and AirPlay-Audio server for Linux, macOS, and Unix (also runs on Windows).
 
 ### **Now developed at the GitHub site <https://github.com/FDH2/UxPlay> (where ALL user issues should be posted, and latest versions can be found).**
