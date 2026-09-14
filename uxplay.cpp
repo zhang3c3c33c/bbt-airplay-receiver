@@ -215,6 +215,7 @@ static GMainLoop *gmainloop = NULL;
 static bool mux_to_file = false;
 static std::string mux_filename = "recording";
 static bool bbap_stdio = false;
+static bool discovery_only = false;
 static bbap::Configure bbap_config;
 static std::atomic<bool> bbap_shutdown_requested(false);
 static std::atomic<bool> bbap_disconnect_requested(false);
@@ -1262,6 +1263,8 @@ static void parse_arguments (int argc, char *argv[]) {
         std::string arg(argv[i]);
         if (arg == "--bbap-stdio") {
             bbap_stdio = true;
+        } else if (arg == "--discovery-only") {
+            discovery_only = true;
         } else if (arg == "--protocol-major") {
             if (i + 1 >= argc) {
                 fprintf(stderr, "--protocol-major requires a value\n");
@@ -2832,6 +2835,7 @@ static int start_raop_server (unsigned short display[5], unsigned short tcp[3], 
         LOGE("Error initializing raop!");
         return -1;
     }
+    raop_set_discovery_only(raop, discovery_only);
     raop_set_log_callback(raop, log_callback, NULL);
     raop_set_log_level(raop, log_level);
     /* set nohold = 1 to allow  capture by new client */
@@ -3005,9 +3009,15 @@ int main (int argc, char *argv[]) {
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--bbap-stdio")) {
             bbap_stdio = true;
+        } else if (!strcmp(argv[i], "--discovery-only")) {
+            discovery_only = true;
         } else if (!strcmp(argv[i], "--protocol-major") && i + 1 < argc) {
             requested_protocol_major = (unsigned int) strtoul(argv[++i], NULL, 10);
         }
+    }
+    if (discovery_only && !bbap_stdio) {
+        fprintf(stderr, "--discovery-only requires --bbap-stdio\n");
+        return 1;
     }
     if (bbap_stdio) {
         std::string error;

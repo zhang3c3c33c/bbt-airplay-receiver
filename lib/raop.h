@@ -32,6 +32,8 @@ extern "C" {
 #endif
 
 typedef struct raop_s raop_t;
+/* Keep DNS-SD/control listening available without accepting media sessions. */
+RAOP_API void raop_set_discovery_only(raop_t *raop, bool enabled);
 
 typedef void (*raop_log_callback_t)(void *cls, int level, const char *msg);
 

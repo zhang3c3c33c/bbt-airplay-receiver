@@ -43,6 +43,7 @@ static void plist_mem_free(void *ptr) {
 #endif
 
 struct raop_s {
+    bool discovery_only;
     /* Callbacks for audio and video */
     raop_callbacks_t callbacks;
 
@@ -97,6 +98,10 @@ struct raop_s {
   /* used for setting HLS video language choices */
     char *lang;
 };
+
+void raop_set_discovery_only(raop_t *raop, bool enabled) {
+    raop->discovery_only = enabled;
+}
 
 struct raop_conn_s {
     raop_t *raop;
@@ -179,7 +184,7 @@ conn_init(void *opaque, unsigned char *local, int locallen, unsigned char *remot
 
     conn->have_active_remote = false;
     
-    if (raop->callbacks.conn_init) {
+    if (!raop->discovery_only && raop->callbacks.conn_init) {
         raop->callbacks.conn_init(raop->callbacks.cls);
     }
 
@@ -217,6 +222,17 @@ conn_request(void *ptr, http_request_t *request, http_response_t **response) {
     const char *protocol = http_request_get_protocol(request);
 
     if (!method  || !url || !protocol) {
+        return;
+    }
+
+    if (raop->discovery_only) {
+        *response = http_response_create();
+        http_response_init(*response, protocol, 503, "Service Unavailable");
+        const char *cseq = http_request_get_header(request, "CSeq");
+        if (cseq) http_response_add_header(*response, "CSeq", cseq);
+        http_response_add_header(*response, "Connection", "close");
+        http_response_finish(*response, NULL, 0);
+        http_response_set_disconnect(*response, 1);
         return;
     }
 
@@ -549,7 +565,7 @@ conn_destroy(void *ptr) {
     raop_t *raop = conn->raop;
     logger_log(raop->logger, LOGGER_DEBUG, "Destroying connection");
 
-    if (raop->callbacks.conn_destroy) {
+    if (!raop->discovery_only && raop->callbacks.conn_destroy) {
         raop->callbacks.conn_destroy(raop->callbacks.cls);
     }
 
