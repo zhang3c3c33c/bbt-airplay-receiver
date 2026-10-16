@@ -7,3 +7,6 @@ add_library( dnssd
 
 
 
+if (WIN32)
+  target_link_libraries( dnssd iphlpapi ws2_32 )
+endif()

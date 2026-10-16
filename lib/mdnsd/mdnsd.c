@@ -23,6 +23,9 @@
 #endif
 
 #include "../compat.h"
+#ifdef WIN32
+#include <iphlpapi.h>
+#endif
 #include "mdnsd.h"
 
 #define MDNS_ADDR4 "224.0.0.251"
@@ -345,7 +348,8 @@ static int mdns_query_type_matches(uint16_t query_type, uint16_t record_type)
     return query_type == record_type || query_type == DNS_TYPE_ANY;
 }
 
-static uint32_t mdns_get_default_ipv4(void)
+/* Local source address the OS would use to reach dest (no packet is sent). */
+static uint32_t mdns_route_source_ipv4(const char *dest, unsigned short port)
 {
     int fd;
     uint32_t addr = 0;
@@ -360,8 +364,8 @@ static uint32_t mdns_get_default_ipv4(void)
 
     memset(&remote, 0, sizeof(remote));
     remote.sin_family = AF_INET;
-    remote.sin_port = htons(MDNS_PORT);
-    inet_pton(AF_INET, MDNS_ADDR4, &remote.sin_addr);
+    remote.sin_port = htons(port);
+    inet_pton(AF_INET, dest, &remote.sin_addr);
 
     if (connect(fd, (struct sockaddr *) &remote, sizeof(remote)) == 0 &&
         getsockname(fd, (struct sockaddr *) &local, &local_len) == 0) {
@@ -369,6 +373,80 @@ static uint32_t mdns_get_default_ipv4(void)
     }
 
     CLOSESOCKET(fd);
+    return addr;
+}
+
+#ifdef WIN32
+/* Windows keeps a stale DHCP address (DadState "Deprecated") on an adapter whose
+ * media is disconnected, and may still pick it as the multicast source. Advertising
+ * that address makes clients see the receiver but fail to connect, so only accept
+ * addresses on adapters that are up and whose address is preferred. With addr == 0,
+ * returns the first such non-loopback, non-link-local address instead. */
+static uint32_t mdns_usable_ipv4(uint32_t addr)
+{
+    ULONG buflen = 15 * 1024;
+    IP_ADAPTER_ADDRESSES *adapters = NULL;
+    uint32_t found = 0;
+    ULONG ret = ERROR_BUFFER_OVERFLOW;
+
+    for (int tries = 0; tries < 3 && ret == ERROR_BUFFER_OVERFLOW; tries++) {
+        free(adapters);
+        adapters = (IP_ADAPTER_ADDRESSES *) malloc(buflen);
+        if (!adapters) {
+            return 0;
+        }
+        ret = GetAdaptersAddresses(AF_INET, GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST |
+                                   GAA_FLAG_SKIP_DNS_SERVER, NULL, adapters, &buflen);
+    }
+    if (ret != NO_ERROR) {
+        free(adapters);
+        return 0;
+    }
+
+    for (IP_ADAPTER_ADDRESSES *a = adapters; a && !found; a = a->Next) {
+        if (a->OperStatus != IfOperStatusUp || a->IfType == IF_TYPE_SOFTWARE_LOOPBACK ||
+            (a->Flags & IP_ADAPTER_NO_MULTICAST)) {
+            continue;
+        }
+        for (IP_ADAPTER_UNICAST_ADDRESS *u = a->FirstUnicastAddress; u; u = u->Next) {
+            if (u->DadState != IpDadStatePreferred || !u->Address.lpSockaddr ||
+                u->Address.lpSockaddr->sa_family != AF_INET) {
+                continue;
+            }
+            uint32_t candidate = ((struct sockaddr_in *) u->Address.lpSockaddr)->sin_addr.s_addr;
+            if (addr) {
+                if (candidate == addr) {
+                    found = candidate;
+                    break;
+                }
+            } else if ((ntohl(candidate) & 0xFFFF0000u) != 0xA9FE0000u) { /* skip 169.254/16 */
+                found = candidate;
+                break;
+            }
+        }
+    }
+
+    free(adapters);
+    return found;
+}
+#endif
+
+static uint32_t mdns_get_default_ipv4(void)
+{
+    uint32_t addr = mdns_route_source_ipv4(MDNS_ADDR4, MDNS_PORT);
+#ifdef WIN32
+    if (!addr || !mdns_usable_ipv4(addr)) {
+        /* Fall back to the default-route source address, then to any usable adapter. */
+        uint32_t route_addr = mdns_route_source_ipv4("8.8.8.8", 53);
+        uint32_t stale = addr;
+        addr = (route_addr && mdns_usable_ipv4(route_addr)) ? route_addr : mdns_usable_ipv4(0);
+        char stale_str[INET_ADDRSTRLEN] = "none", addr_str[INET_ADDRSTRLEN] = "none";
+        if (stale) inet_ntop(AF_INET, &stale, stale_str, sizeof(stale_str));
+        if (addr) inet_ntop(AF_INET, &addr, addr_str, sizeof(addr_str));
+        fprintf(stderr, "mdnsd: multicast source %s is not on a connected adapter; advertising %s\n",
+                stale_str, addr_str);
+    }
+#endif
     return addr;
 }
 
