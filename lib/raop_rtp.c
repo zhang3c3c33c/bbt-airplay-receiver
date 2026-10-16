@@ -482,7 +482,12 @@ raop_rtp_thread_udp(void *arg)
                 unsigned char *resent_packet =  &packet[4];
                 unsigned int resent_packetlen = packetlen - 4;
                 unsigned short seqnum = byteutils_get_short_be(resent_packet, 2);
-                if (resent_packetlen >= 12) {
+                if (resent_packetlen == 12 ||
+                    (resent_packetlen == 16 && memcmp(resent_packet + 12, no_data_marker, 4) == 0)) {
+                    /* iOS mirror audio answers resends of frames it no longer holds with a "no data" packet */
+                    logger_log(raop_rtp->logger, LOGGER_DEBUG, "raop_rtp resend answered with no data: seqnum=%u", seqnum);
+                    raop_buffer_mark_missing(raop_rtp->buffer, seqnum);
+                } else if (resent_packetlen >= 12) {
                     logger_log(raop_rtp->logger, LOGGER_DEBUG, "raop_rtp resent audio packet: seqnum=%u", seqnum);
                     int result = raop_buffer_enqueue(raop_rtp->buffer, resent_packet, resent_packetlen, 1);
                     assert(result >= 0);
@@ -605,6 +610,8 @@ raop_rtp_thread_udp(void *arg)
 
             if (packetlen == 12 ||(packetlen == 16 && memcmp(packet + 12, no_data_marker, 4) == 0)) {
                 /* this is a "no data" packet */
+                /* mid-stream its seqnum would otherwise leave a hole that stalls dequeue */
+                raop_buffer_mark_missing(raop_rtp->buffer, byteutils_get_short_be(packet, 2));
 	        /* the first such packet could be used to provide the initial rtptime and seqnum formerly given in the RECORD request */
                 continue;
             }
